@@ -1,0 +1,706 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Música con las manos</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden}
+  body{display:flex;align-items:center;justify-content:center}
+  canvas{display:block;background:#050608}
+  /* Pantalla completa (ventana / F11) */
+  body.full canvas{position:fixed;inset:0;width:100vw;height:100vh}
+  /* ?reel: marco 9:16 centrado, sin importar el tamaño de la ventana */
+  body.reel canvas{width:min(100vw,calc(100vh*9/16));height:min(100vh,calc(100vw*16/9))}
+  body.running{cursor:none}
+  #cam{position:fixed;width:1px;height:1px;opacity:0;pointer-events:none}
+  #menu{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);display:flex;gap:12px;flex-wrap:wrap;justify-content:center}
+  #menu button{
+    padding:12px 26px;background:rgba(0,0,0,.55);color:#dfffff;
+    border:1px solid rgba(160,240,255,.5);border-radius:999px;
+    font:500 15px -apple-system,BlinkMacSystemFont,system-ui,sans-serif;
+    letter-spacing:.04em;cursor:pointer;backdrop-filter:blur(6px)}
+  #menu button:disabled{opacity:.6;cursor:default}
+</style>
+</head>
+<body class="full">
+<canvas id="stage"></canvas>
+<video id="cam" playsinline muted autoplay></video>
+<div id="menu"><button data-mode="harp">Arpa llanera</button><button data-mode="xylo">Xilófono</button><button data-mode="drums">Tambores</button><button data-mode="free">Cuerdas libres</button></div>
+
+<script type="module">
+import { FilesetResolver, HandLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+const WASM_URL  = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
+const MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+
+const TIPS  = [4, 8, 12, 16, 20];   // punta de pulgar, índice, medio, anular, meñique
+const BONES = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],
+               [9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+const PINCH_RATIO = 0.35;           // pulgar-índice más cerca que 35 % del tamaño de la palma
+const PINCH_HOLD_MS = 350;
+
+const params = new URLSearchParams(location.search);
+const REEL = params.has("reel");
+const canvas = document.getElementById("stage");
+const ctx    = canvas.getContext("2d");
+const video  = document.getElementById("cam");
+const menu   = document.getElementById("menu");
+const HARP_N = 22;   // 22 notas diatónicas: C3 a C6
+document.body.classList.add(REEL ? "reel" : "full");
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+
+/* ---------- Tamaño del lienzo ---------- */
+let mode = "free", harp = [], xylo = [], drums = [];
+let W = 0, H = 0, sc = 1;
+function resize() {
+  if (REEL) { W = 1080; H = 1920; }
+  else {
+    const d = Math.min(window.devicePixelRatio || 1, 2);
+    W = Math.round(innerWidth * d); H = Math.round(innerHeight * d);
+  }
+  canvas.width = W; canvas.height = H; sc = W / 1080;
+  buildHarp();
+  buildXylo();
+  buildDrums();
+}
+
+// Arpa: triángulo con tabla (izquierda), poste (derecha) y base. Las cuerdas van de la tabla al poste.
+// Las de abajo son más largas, así que suenan más graves: f = K / L.
+const HARP_T = () => ({ x: 0.80 * W, y: 0.20 * H });
+const HARP_L = () => ({ x: 0.22 * W, y: 0.80 * H });
+const HARP_R = () => ({ x: 0.80 * W, y: 0.80 * H });
+// Xilófono: 15 notas diatónicas de C4 a C6 (declaradas antes de la primera llamada a resize)
+const XYLO_N = 15;
+const XYLO_FREQS = Array.from({ length: XYLO_N }, (_, n) => {
+  const MAJ = [0, 2, 4, 5, 7, 9, 11];
+  return 261.63 * Math.pow(2, (Math.floor(n / 7) * 12 + MAJ[n % 7]) / 12);
+});
+// Tambores: 6 piezas en dos filas. "sound" es el tipo de golpe o la frecuencia de un tom.
+const DRUMS = [
+  { name: "hat",   x: 0.25, y: 0.52, sound: "hat" },
+  { name: "snare", x: 0.50, y: 0.52, sound: "snare" },
+  { name: "crash", x: 0.75, y: 0.52, sound: "crash" },
+  { name: "tom1",  x: 0.25, y: 0.80, sound: 150 },
+  { name: "kick",  x: 0.50, y: 0.80, sound: "kick" },
+  { name: "tom2",  x: 0.75, y: 0.80, sound: 220 },
+];
+// Escala diatónica de Do mayor desde C3, de grave a agudo
+const HARP_FREQS = Array.from({ length: HARP_N }, (_, n) => {
+  const MAJ = [0, 2, 4, 5, 7, 9, 11];
+  const semis = Math.floor(n / 7) * 12 + MAJ[n % 7];
+  return 130.81 * Math.pow(2, semis / 12);
+});
+function buildHarp() {
+  const T = HARP_T(), L = HARP_L(), R = HARP_R();
+  harp = [];
+  const fLow = HARP_FREQS[0], uMax = 0.97;
+  // Longitud de cada cuerda según su nota: L ∝ 1/f, así la afinación sale de la geometría
+  for (let i = 0; i < HARP_N; i++) {
+    const f = HARP_FREQS[HARP_N - 1 - i];        // i = 0 es la más corta (arriba)
+    const u = uMax * fLow / f;
+    const S = { x: T.x + (L.x - T.x) * u, y: T.y + (L.y - T.y) * u };   // en la tabla
+    const C = { x: T.x + (R.x - T.x) * u, y: T.y + (R.y - T.y) * u };   // en el poste
+    harp.push({ id: "h" + i, harpStr: true, p1: S, p2: C, freq: f, alpha: 1, vibT: -1, vibA: 0 });
+  }
+}
+addEventListener("resize", resize); resize();
+
+/* ---------- Cámara -> lienzo (cover, espejo) ---------- */
+const map = { s: 1, dx: 0, dy: 0, vw: 1, vh: 1, ok: false };
+function updateMap() {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw || !vh) return;
+  const s = Math.max(W / vw, H / vh);
+  Object.assign(map, { s, vw, vh, dx: (W - vw * s) / 2, dy: (H - vh * s) / 2, ok: true });
+}
+// Coordenadas normalizadas de MediaPipe -> píxeles del lienzo, con espejo
+const toC = p => ({ x: map.dx + (1 - p.x) * map.vw * map.s, y: map.dy + p.y * map.vh * map.s });
+const camWidthPx = () => map.vw * map.s;
+
+/* ---------- Audio: Karplus-Strong + reverb ---------- */
+let actx = null, master, verb, tone;
+function buildAudio() {
+  if (actx) actx.close();
+  actx = new AudioContext();
+  const comp = actx.createDynamicsCompressor();
+  master = actx.createGain(); master.gain.value = 0.6;
+  master.connect(comp); comp.connect(actx.destination);
+  const conv = actx.createConvolver(); conv.buffer = makeIR(0.9);
+  const wet = actx.createGain(); wet.gain.value = 0.08;
+  verb = actx.createGain(); verb.connect(conv); conv.connect(wet); wet.connect(master);
+  // Filtro de salida: quita el brillo áspero de los agudos
+  tone = actx.createBiquadFilter(); tone.type = "lowpass"; tone.frequency.value = 3200; tone.Q.value = 0.4;
+  tone.connect(master);
+}
+function makeIR(sec) {
+  const n = Math.floor(actx.sampleRate * sec), b = actx.createBuffer(2, n, actx.sampleRate);
+  for (let c = 0; c < 2; c++) {
+    const d = b.getChannelData(c);
+    for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / n, 3);
+  }
+  return b;
+}
+// Cuerda pulsada: el periodo de la línea de retardo es sampleRate/f.
+function pluckNote(freq, amp, pan) {
+  const sr = actx.sampleRate;
+  const N = Math.max(2, Math.round(sr / freq));
+  const len = Math.round(sr * 1.0);
+  const buf = actx.createBuffer(1, len, sr), d = buf.getChannelData(0);
+  const g = Math.exp(-6.9 / (0.9 * sr));          // ~ -60 dB a 0.9 s
+  // Ataque suave: ruido filtrado en tres pasadas (menos siseo que el ruido blanco)
+  let a1 = 0, a2 = 0, a3 = 0;
+  for (let i = 0; i < N; i++) {
+    const r = Math.random() * 2 - 1;
+    const v = (r + 3 * a1 + 3 * a2 + a3) / 8; a3 = a2; a2 = a1; a1 = v; d[i] = v;
+  }
+  for (let i = N; i < len; i++) d[i] = g * 0.5 * (d[i - N] + d[i - N + 1]);
+
+  const src = actx.createBufferSource(); src.buffer = buf;
+  const vg = actx.createGain(); vg.gain.value = 0.8 * amp;
+  const p = actx.createStereoPanner(); p.pan.value = clamp(pan, -0.7, 0.7);
+  const send = actx.createGain(); send.gain.value = 0.15;
+  src.connect(vg); vg.connect(p); p.connect(tone); p.connect(send); send.connect(verb);
+  src.start();
+}
+
+// Barra golpeada: seno con un parcial inarmónico (×3.93) que se apaga rápido, como madera
+function barNote(freq, amp, pan) {
+  const t0 = actx.currentTime;
+  const env = actx.createGain();
+  env.gain.setValueAtTime(0.0001, t0);
+  env.gain.exponentialRampToValueAtTime(0.9 * amp, t0 + 0.003);
+  env.gain.exponentialRampToValueAtTime(0.0001, t0 + 1.2);
+  const o1 = actx.createOscillator(); o1.type = "sine"; o1.frequency.value = freq;
+  const o2 = actx.createOscillator(); o2.type = "sine"; o2.frequency.value = freq * 3.93;
+  const g2 = actx.createGain();
+  g2.gain.setValueAtTime(0.35 * amp, t0);
+  g2.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.35);
+  const p = actx.createStereoPanner(); p.pan.value = clamp(pan, -0.7, 0.7);
+  const send = actx.createGain(); send.gain.value = 0.1;
+  o1.connect(env); o2.connect(g2); g2.connect(env);
+  env.connect(p); p.connect(tone); p.connect(send); send.connect(verb);
+  o1.start(t0); o2.start(t0); o1.stop(t0 + 1.3); o2.stop(t0 + 0.5);
+}
+
+/* ---------- Tambores ---------- */
+function buildDrums() {
+  const r = 0.09 * W;
+  drums = DRUMS.map((d, i) => {
+    const cx = d.x * W, cy = d.y * H;
+    return { id: "d" + i, drum: d.sound, bar: false, freq: 0,
+             cx, cy, r, p1: { x: cx - r, y: cy }, p2: { x: cx + r, y: cy },   // línea de golpe
+             alpha: 1, vibT: -1, vibA: 0 };
+  });
+}
+let noiseBuf = null;
+function noiseSource() {
+  if (!noiseBuf || noiseBuf.sampleRate !== actx.sampleRate) {
+    noiseBuf = actx.createBuffer(1, Math.round(actx.sampleRate * 1.5), actx.sampleRate);
+    const d = noiseBuf.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  }
+  const src = actx.createBufferSource(); src.buffer = noiseBuf;
+  return src;
+}
+function drumHit(sound, amp, pan) {
+  const t0 = actx.currentTime;
+  const out = actx.createGain(); out.gain.value = amp;
+  const p = actx.createStereoPanner(); p.pan.value = clamp(pan, -0.7, 0.7);
+  const send = actx.createGain(); send.gain.value = 0.12;
+  out.connect(p); p.connect(tone); p.connect(send); send.connect(verb);
+  const env = (g, v, t) => { g.gain.setValueAtTime(v, t0); g.gain.exponentialRampToValueAtTime(0.001, t0 + t); };
+  if (sound === "kick") {
+    const o = actx.createOscillator(); o.type = "sine";
+    o.frequency.setValueAtTime(140, t0); o.frequency.exponentialRampToValueAtTime(45, t0 + 0.12);
+    const g = actx.createGain(); env(g, 1, 0.5);
+    o.connect(g); g.connect(out); o.start(t0); o.stop(t0 + 0.55);
+  } else if (sound === "snare") {
+    const n = noiseSource(), bp = actx.createBiquadFilter();
+    bp.type = "bandpass"; bp.frequency.value = 1800; bp.Q.value = 0.8;
+    const g = actx.createGain(); env(g, 0.8, 0.18);
+    n.connect(bp); bp.connect(g); g.connect(out); n.start(t0); n.stop(t0 + 0.2);
+    const o = actx.createOscillator(); o.type = "triangle"; o.frequency.value = 190;
+    const g2 = actx.createGain(); env(g2, 0.6, 0.12);
+    o.connect(g2); g2.connect(out); o.start(t0); o.stop(t0 + 0.15);
+  } else if (sound === "hat") {
+    const n = noiseSource(), hp = actx.createBiquadFilter();
+    hp.type = "highpass"; hp.frequency.value = 7000;
+    const g = actx.createGain(); env(g, 0.6, 0.06);
+    n.connect(hp); hp.connect(g); g.connect(out); n.start(t0); n.stop(t0 + 0.08);
+  } else if (sound === "crash") {
+    const n = noiseSource(), hp = actx.createBiquadFilter();
+    hp.type = "highpass"; hp.frequency.value = 4000;
+    const g = actx.createGain(); env(g, 0.7, 1.4);
+    n.connect(hp); hp.connect(g); g.connect(out); n.start(t0); n.stop(t0 + 1.5);
+  } else {                                           // tom: tono que baja
+    const o = actx.createOscillator(); o.type = "sine";
+    o.frequency.setValueAtTime(sound * 1.35, t0); o.frequency.exponentialRampToValueAtTime(sound, t0 + 0.06);
+    const g = actx.createGain(); env(g, 1, 0.45);
+    o.connect(g); g.connect(out); o.start(t0); o.stop(t0 + 0.5);
+  }
+}
+
+/* ---------- Cuerdas ---------- */
+// Automáticas: entre dedos homólogos (apagadas por defecto, tecla A).
+const strings = TIPS.map((_, k) => ({ id: "a" + k, p1: null, p2: null, alpha: 0, vibT: -1, vibA: 0 }));
+// Creadas por el usuario: fijas en pantalla, con nota propia (freq).
+const userStrings = [];
+let uid = 0, selected = null, autoOn = false;
+const lastHit = {};
+const dbg = [];   // registro de pulsaciones (depuración)
+const particles = [];
+let prevPts = null, pinchStart = null, armed = true;
+
+const lerpP = (p, q, t) => ({ x: p.x + (q.x - p.x) * t, y: p.y + (q.y - p.y) * t });
+const allStrings = () => mode === "harp" ? harp
+  : mode === "xylo" ? xylo
+  : mode === "drums" ? drums
+  : (autoOn ? strings : []).concat(userStrings);
+
+function segHit(a, b, c, d) {
+  const cr = (p, q, r) => (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x);
+  const o1 = cr(a, b, c), o2 = cr(a, b, d), o3 = cr(c, d, a), o4 = cr(c, d, b);
+  if (o1 * o2 >= 0 || o3 * o4 >= 0) return null;
+  const t = o3 / (o3 - o4);
+  return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
+}
+
+function spawn(x, y, amp) {
+  const n = Math.round(18 + 30 * amp);
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2, sp = (0.8 + Math.random() * 3.2) * sc * (0.6 + amp);
+    particles.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp,
+                     life: 0, max: 0.45 + Math.random() * 0.6, r: (1 + Math.random() * 2.2) * sc });
+  }
+  if (particles.length > 700) particles.splice(0, particles.length - 700);
+}
+
+// Frecuencia de una cuerda: la guardada (cuerdas del usuario) o f = K / L (automáticas)
+function pluck(s, hit, sp, x) {
+  const len = Math.hypot(s.p2.x - s.p1.x, s.p2.y - s.p1.y) / camWidthPx();
+  const freq = s.freq ?? clamp(132 / len, 70, 1400);
+  const amp = clamp(sp / (0.03 * W), 0.25, 1);
+  dbg.push({ k: s.id, len, freq, amp });
+  if (actx && actx.state === "running") {
+    const pn = (x / W) * 2 - 1;
+    if (s.drum) drumHit(s.drum, amp, pn);
+    else (s.bar ? barNote : pluckNote)(freq, amp, pn);
+  }
+  s.vibT = performance.now() / 1000; s.vibA = amp;
+  spawn(hit.x, hit.y, amp);
+}
+
+// Pulgar e índice juntos = pellizco
+function pinch(hand) {
+  const a = hand[4], b = hand[8], wrist = hand[0], mid = hand[9];
+  const palm = Math.hypot(wrist.x - mid.x, wrist.y - mid.y);
+  const d = Math.hypot(a.x - b.x, a.y - b.y);
+  return { on: d < PINCH_RATIO * palm, x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+}
+
+function createString(pa, pb) {
+  const len = Math.hypot(pb.x - pa.x, pb.y - pa.y) / camWidthPx();
+  if (len < 0.08) return;                                    // muy corta: se ignora
+  const s = { id: "u" + (++uid), p1: { x: pa.x, y: pa.y }, p2: { x: pb.x, y: pb.y },
+              freq: clamp(132 / len, 70, 1400), alpha: 1, vibT: -1, vibA: 0 };
+  userStrings.push(s);
+  selected = s;
+  spawn((pa.x + pb.x) / 2, (pa.y + pb.y) / 2, 0.7);
+}
+
+function updateAuto(both, pts) {
+  if (both) {
+    TIPS.forEach((t, k) => {
+      const s = strings[k], a = pts[0][t], b = pts[1][t];
+      if (!s.p1 || s.alpha < 0.02) { s.p1 = { ...a }; s.p2 = { ...b }; }
+      else { s.p1 = lerpP(s.p1, a, 0.6); s.p2 = lerpP(s.p2, b, 0.6); }
+      s.alpha = Math.min(1, s.alpha + 0.1);
+    });
+  } else strings.forEach(s => { s.alpha = Math.max(0, s.alpha - 0.05); });
+}
+
+/* ---------- Lógica por frame de detección ---------- */
+function frameLogic(now, pts) {
+  const both = pts && pts.length >= 2;
+  if (autoOn) updateAuto(both, pts); else strings.forEach(s => { s.alpha = 0; });
+
+  // Crear cuerda (solo modo libre): ambos pellizcos sostenidos; hay que soltar para crear otra
+  if (mode === "free" && both) {
+    const pa = pinch(pts[0]), pb = pinch(pts[1]);
+    if (pa.on && pb.on) {
+      if (armed) {
+        if (pinchStart === null) pinchStart = now;
+        else if (now - pinchStart > PINCH_HOLD_MS) { createString(pa, pb); armed = false; pinchStart = null; }
+      }
+    } else {
+      pinchStart = null;
+      if (!pa.on && !pb.on) armed = true;
+    }
+  } else { pinchStart = null; armed = true; }
+
+  // Pulsaciones
+  if (both && prevPts) {
+    for (let h = 0; h < 2; h++) for (const t of TIPS) {
+      const cur = pts[h][t], prev = prevPts[h][t];
+      const sp = Math.hypot(cur.x - prev.x, cur.y - prev.y);
+      if (sp < 0.004 * W || sp > 0.25 * W) continue;     // quieto o salto de tracking
+      for (const s of allStrings()) {
+        if (s.alpha < 0.6 || !s.p1) continue;
+        const key = s.id + "-" + h + "-" + t;
+        if (now - (lastHit[key] || 0) < 160) continue;
+        const hit = segHit(prev, cur, s.p1, s.p2);
+        if (!hit) continue;
+        lastHit[key] = now;
+        pluck(s, hit, sp, cur.x);
+      }
+    }
+  }
+  prevPts = both ? pts.slice(0, 2) : null;
+}
+
+/* ---------- Dibujo ---------- */
+function drawBackground() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = "#050608"; ctx.fillRect(0, 0, W, H);
+  if (map.ok && video.readyState >= 2) {
+    ctx.setTransform(-1, 0, 0, 1, W, 0);            // espejo
+    ctx.drawImage(video, map.dx, map.dy, map.vw * map.s, map.vh * map.s);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = "rgba(0,0,0,0.2)"; ctx.fillRect(0, 0, W, H);
+  }
+}
+
+function drawStrings(nowSec) {
+  ctx.lineCap = "round";
+  allStrings().forEach(s => {
+    if (s.bar || s.drum || s.harpStr || s.alpha < 0.02 || !s.p1) return;
+    const isSel = s === selected;
+    const dx = s.p2.x - s.p1.x, dy = s.p2.y - s.p1.y, len = Math.hypot(dx, dy) || 1;
+    const nx = -dy / len, ny = dx / len;
+    const age = s.vibT >= 0 ? nowSec - s.vibT : 99;
+    const env = s.vibA * Math.exp(-age * 3.2) * 26 * sc;
+    const flash = Math.exp(-age * 6);
+    const off = u => env * Math.sin(Math.PI * u) * Math.cos(2 * Math.PI * 11 * age);
+    const at = u => ({ x: s.p1.x + dx * u + nx * off(u), y: s.p1.y + dy * u + ny * off(u) });
+
+    ctx.globalAlpha = s.alpha;
+    ctx.beginPath();
+    for (let i = 0; i <= 48; i++) { const p = at(i / 48); i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y); }
+    ctx.shadowColor = "rgba(140,220,255,0.9)";
+    ctx.shadowBlur = (isSel ? 22 : 14) * sc;
+    ctx.strokeStyle = `rgba(190,245,255,${0.55 + 0.45 * flash})`;
+    ctx.lineWidth = (2 + (isSel ? 1.5 : 0) + 3 * flash) * sc;
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+
+    // marcas de medición
+    ctx.strokeStyle = "rgba(200,250,255,0.6)";
+    ctx.lineWidth = 1.5 * sc;
+    ctx.beginPath();
+    for (let i = 0; i <= 10; i++) {
+      const u = i / 10, p = at(u);
+      const L = (i === 0 || i === 10) ? 26 : (i % 5 === 0 ? 16 : 9);
+      ctx.moveTo(p.x - nx * L * sc / 2, p.y - ny * L * sc / 2);
+      ctx.lineTo(p.x + nx * L * sc / 2, p.y + ny * L * sc / 2);
+    }
+    ctx.stroke();
+  });
+  ctx.globalAlpha = 1;
+}
+
+// Xilófono: 15 barras diatónicas de C4 a C6. Una barra depende de su largo: f ∝ 1/L²,
+// así que L ∝ 1/√f (las graves son más largas).
+function buildXylo() {
+  xylo = [];
+  const fLow = XYLO_FREQS[0];
+  for (let j = 0; j < XYLO_N; j++) {                 // j = 0 es la más grave (abajo)
+    const f = XYLO_FREQS[j];
+    const y = (0.80 - 0.55 * j / (XYLO_N - 1)) * H;
+    const L = 0.46 * W * Math.sqrt(fLow / f);
+    xylo.push({ id: "x" + j, bar: true, freq: f,
+                p1: { x: 0.5 * W - L / 2, y }, p2: { x: 0.5 * W + L / 2, y },
+                alpha: 1, vibT: -1, vibA: 0 });
+  }
+}
+
+function woodGrad(x0, y0, x1, y1) {
+  const g = ctx.createLinearGradient(x0, y0, x1, y1);
+  g.addColorStop(0, "#4a2813"); g.addColorStop(0.45, "#b77a3a");
+  g.addColorStop(0.7, "#e0a862"); g.addColorStop(1, "#4a2813");
+  return g;
+}
+
+// Arpa llanera: marco de madera (poste, base y tabla), clavijas y cuerdas doradas/plateadas
+function drawHarpFrame(nowSec) {
+  const T = HARP_T(), L = HARP_L(), R = HARP_R();
+  const framePath = () => {
+    ctx.beginPath(); ctx.moveTo(L.x, L.y); ctx.lineTo(T.x, T.y); ctx.lineTo(R.x, R.y); ctx.lineTo(L.x, L.y);
+  };
+  ctx.lineJoin = "round"; ctx.lineCap = "round";
+  // sombra y madera
+  ctx.shadowColor = "rgba(0,0,0,0.6)"; ctx.shadowBlur = 18 * sc; ctx.shadowOffsetY = 6 * sc;
+  framePath(); ctx.strokeStyle = woodGrad(L.x, T.y, R.x, R.y); ctx.lineWidth = 26 * sc; ctx.stroke();
+  ctx.shadowBlur = 0; ctx.shadowOffsetY = 0;
+  framePath(); ctx.strokeStyle = "rgba(255,220,160,0.45)"; ctx.lineWidth = 3 * sc; ctx.stroke();
+  // capitel tallado en la punta
+  ctx.beginPath(); ctx.arc(T.x, T.y, 16 * sc, 0, Math.PI * 2);
+  ctx.fillStyle = woodGrad(T.x - 16 * sc, T.y, T.x + 16 * sc, T.y); ctx.fill();
+  // clavijas doradas a lo largo del poste
+  const pegN = harp.length;
+  for (let k = 0; k < pegN; k++) {
+    const u = 0.25 + 0.72 * (k / (pegN - 1));
+    const x = T.x + (R.x - T.x) * u, y = T.y + (R.y - T.y) * u;
+    ctx.beginPath(); ctx.arc(x + 14 * sc, y, 5 * sc, 0, Math.PI * 2);
+    ctx.fillStyle = "#e7c15a"; ctx.fill();
+  }
+  // cuerdas
+  harp.forEach((s, i) => {
+    const age = s.vibT >= 0 ? nowSec - s.vibT : 99;
+    const flash = Math.exp(-age * 6) * s.vibA;
+    const gold = i < 12;
+    ctx.strokeStyle = gold ? `rgba(${Math.round(225 + 30 * flash)},${Math.round(180 + 60 * flash)},${Math.round(90 + 120 * flash)},0.95)`
+                           : `rgba(${Math.round(225 + 30 * flash)},${Math.round(228 + 27 * flash)},${Math.round(235 + 20 * flash)},0.95)`;
+    ctx.shadowColor = gold ? "rgba(255,210,120,0.7)" : "rgba(220,240,255,0.7)";
+    ctx.shadowBlur = (4 + 12 * flash) * sc;
+    ctx.lineWidth = (1.8 + 2.5 * flash) * sc;
+    ctx.beginPath(); ctx.moveTo(s.p1.x, s.p1.y); ctx.lineTo(s.p2.x, s.p2.y); ctx.stroke();
+  });
+  ctx.shadowBlur = 0;
+}
+
+// Xilófono: soportes de madera y barras de colores (rojo abajo, violeta arriba)
+function drawBars(nowSec) {
+  ctx.lineCap = "round";
+  const bottom = xylo[0], top = xylo[xylo.length - 1];
+  const half = (bottom.p2.x - bottom.p1.x) / 2 + 0.03 * W;
+  const cx = 0.5 * W;
+  const yTop = top.p1.y - 30 * sc, yBot = bottom.p1.y + 40 * sc;
+  // soportes laterales
+  [cx - half, cx + half].forEach(x => {
+    ctx.beginPath(); ctx.moveTo(x, yTop); ctx.lineTo(x, yBot);
+    ctx.strokeStyle = woodGrad(x - 10 * sc, yTop, x + 10 * sc, yTop); ctx.lineWidth = 16 * sc; ctx.stroke();
+  });
+  // travesaño inferior
+  ctx.beginPath(); ctx.moveTo(cx - half, yBot); ctx.lineTo(cx + half, yBot);
+  ctx.strokeStyle = woodGrad(cx - half, yBot, cx + half, yBot); ctx.lineWidth = 14 * sc; ctx.stroke();
+  // barras
+  xylo.forEach((b, j) => {
+    const age = b.vibT >= 0 ? nowSec - b.vibT : 99;
+    const flash = Math.exp(-age * 8) * b.vibA;
+    const hue = 2 + j * (290 / (XYLO_N - 1));
+    const light = 52 + 18 * flash;
+    ctx.shadowColor = `hsla(${hue},90%,60%,${0.4 + 0.5 * flash})`;
+    ctx.shadowBlur = (6 + 18 * flash) * sc;
+    ctx.strokeStyle = `hsl(${hue},80%,${light}%)`;
+    ctx.lineWidth = 22 * sc;
+    ctx.beginPath(); ctx.moveTo(b.p1.x, b.p1.y); ctx.lineTo(b.p2.x, b.p2.y); ctx.stroke();
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle = "rgba(255,255,255,0.35)"; ctx.lineWidth = 3 * sc;
+    ctx.beginPath(); ctx.moveTo(b.p1.x + 4 * sc, b.p1.y - 6 * sc); ctx.lineTo(b.p2.x - 4 * sc, b.p2.y - 6 * sc); ctx.stroke();
+  });
+}
+
+// Tambores: bombo de frente, caja cromada, toms de laca, platillo y hi-hat con pie
+function drawDrums(nowSec) {
+  const sorted = [...drums].sort((a, b) => a.cy - b.cy);   // atrás primero
+  sorted.forEach(d => {
+    const age = d.vibT >= 0 ? nowSec - d.vibT : 99;
+    const flash = Math.exp(-age * 10) * d.vibA;
+    const { cx, cy, r } = d;
+    const kind = d.drum;
+    ctx.lineJoin = "round";
+    if (kind === "kick") {
+      ctx.shadowColor = "rgba(0,0,0,0.6)"; ctx.shadowBlur = 16 * sc; ctx.shadowOffsetY = 6 * sc;
+      ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2);
+      ctx.fillStyle = `rgb(${Math.round(20 + 60 * flash)},${Math.round(20 + 40 * flash)},${Math.round(26 + 40 * flash)})`; ctx.fill();
+      ctx.shadowBlur = 0; ctx.shadowOffsetY = 0;
+      ctx.lineWidth = 8 * sc; ctx.strokeStyle = "#d9b25c"; ctx.stroke();
+      ctx.beginPath(); ctx.arc(cx, cy, r * 0.42, 0, Math.PI * 2);
+      ctx.fillStyle = "#f2ecd9"; ctx.fill();
+      ctx.lineWidth = 3 * sc; ctx.strokeStyle = "#7a1d2b"; ctx.stroke();
+    } else if (kind === "snare") {
+      const h = 0.42 * r;
+      ctx.beginPath(); ctx.rect(cx - r, cy, 2 * r, h);
+      const g = ctx.createLinearGradient(cx - r, 0, cx + r, 0);
+      g.addColorStop(0, "#6b7077"); g.addColorStop(0.4, "#e8ebef"); g.addColorStop(1, "#5c6168");
+      ctx.fillStyle = g; ctx.fill();
+      ctx.beginPath(); ctx.ellipse(cx, cy + h, r, r * 0.22, 0, 0, Math.PI); ctx.fillStyle = "#4a4e55"; ctx.fill();
+      drawHead(cx, cy, r, flash);
+    } else if (typeof kind === "number") {          // tom: laca roja
+      const h = 0.6 * r;
+      ctx.beginPath(); ctx.rect(cx - r, cy, 2 * r, h);
+      const g = ctx.createLinearGradient(cx - r, 0, cx + r, 0);
+      g.addColorStop(0, "#5a0f1a"); g.addColorStop(0.45, "#c0303f"); g.addColorStop(1, "#5a0f1a");
+      ctx.fillStyle = g; ctx.fill();
+      ctx.beginPath(); ctx.ellipse(cx, cy + h, r, r * 0.22, 0, 0, Math.PI); ctx.fillStyle = "#3a0a12"; ctx.fill();
+      drawHead(cx, cy, r, flash);
+    } else if (kind === "crash") {
+      ctx.beginPath(); ctx.moveTo(cx, cy + 0.3 * r); ctx.lineTo(cx, cy + 1.7 * r);
+      ctx.strokeStyle = "#8a8f96"; ctx.lineWidth = 6 * sc; ctx.stroke();
+      drawCymbal(cx, cy, r, flash);
+    } else if (kind === "hat") {
+      ctx.beginPath(); ctx.moveTo(cx, cy + 0.3 * r); ctx.lineTo(cx, cy + 1.7 * r);
+      ctx.strokeStyle = "#8a8f96"; ctx.lineWidth = 6 * sc; ctx.stroke();
+      drawCymbal(cx, cy + 0.12 * r, r, flash);   // platillo de abajo
+      drawCymbal(cx, cy - 0.10 * r, r, flash);   // platillo de arriba
+    }
+    // línea de golpe (guía)
+    ctx.strokeStyle = "rgba(255,255,255,0.18)"; ctx.lineWidth = 2 * sc;
+    ctx.beginPath(); ctx.moveTo(d.p1.x, d.p1.y); ctx.lineTo(d.p2.x, d.p2.y); ctx.stroke();
+  });
+}
+
+function drawHead(cx, cy, r, flash) {
+  ctx.beginPath(); ctx.ellipse(cx, cy, r, r * 0.26, 0, 0, Math.PI * 2);
+  ctx.fillStyle = `rgb(${Math.round(232 + 23 * flash)},${Math.round(224 + 31 * flash)},${Math.round(200 + 55 * flash)})`;
+  ctx.fill();
+  ctx.lineWidth = 7 * sc; ctx.strokeStyle = "#cfd3d8"; ctx.stroke();
+  // tornillos del aro
+  for (let k = 0; k < 8; k++) {
+    const a = (k / 8) * Math.PI * 2;
+    ctx.beginPath(); ctx.arc(cx + Math.cos(a) * r * 0.98, cy + Math.sin(a) * r * 0.26, 3 * sc, 0, Math.PI * 2);
+    ctx.fillStyle = "#9aa0a8"; ctx.fill();
+  }
+}
+
+function drawCymbal(cx, cy, r, flash) {
+  const g = ctx.createRadialGradient(cx, cy, r * 0.1, cx, cy, r);
+  g.addColorStop(0, `rgb(${Math.round(255)},${Math.round(232 + 20 * flash)},${Math.round(150 + 80 * flash)})`);
+  g.addColorStop(0.6, "#d4a53a"); g.addColorStop(1, "#7a5a18");
+  ctx.beginPath(); ctx.ellipse(cx, cy, r, r * 0.28, 0, 0, Math.PI * 2);
+  ctx.fillStyle = g; ctx.fill();
+  ctx.lineWidth = 2 * sc; ctx.strokeStyle = "rgba(90,60,10,0.7)"; ctx.stroke();
+  ctx.beginPath(); ctx.ellipse(cx, cy, r * 0.22, r * 0.06, 0, 0, Math.PI * 2);
+  ctx.fillStyle = "#8a6a20"; ctx.fill();
+}
+
+function drawParticles(dt) {
+  ctx.globalCompositeOperation = "lighter";
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.life += dt;
+    if (p.life >= p.max) { particles.splice(i, 1); continue; }
+    p.x += p.vx * dt * 60; p.y += p.vy * dt * 60;
+    p.vx *= 0.97; p.vy *= 0.97;
+    const a = 1 - p.life / p.max;
+    ctx.fillStyle = `rgba(120,220,255,${0.25 * a})`;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r * 3, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = `rgba(255,255,255,${a})`;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalCompositeOperation = "source-over";
+}
+
+function drawHands(pts) {
+  ctx.lineCap = "round";
+  pts.forEach(hand => {
+    ctx.strokeStyle = "#33ff66";
+    ctx.lineWidth = 2.5 * sc;
+    ctx.beginPath();
+    BONES.forEach(([a, b]) => { ctx.moveTo(hand[a].x, hand[a].y); ctx.lineTo(hand[b].x, hand[b].y); });
+    ctx.stroke();
+    ctx.fillStyle = "#ff2a2a";
+    hand.forEach(p => { ctx.beginPath(); ctx.arc(p.x, p.y, 4.5 * sc, 0, Math.PI * 2); ctx.fill(); });
+  });
+}
+
+/* ---------- Bucle principal ---------- */
+let landmarker = null, last = performance.now(), lastVT = -1, curPts = [];
+function loop(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  updateMap();
+  drawBackground();
+  if (video.readyState >= 2 && video.currentTime !== lastVT) {
+    lastVT = video.currentTime;
+    const res = landmarker.detectForVideo(video, now);
+    curPts = (res.landmarks || []).map(lm => lm.map(toC));
+    curPts.sort((a, b) => a[0].x - b[0].x);
+    curPts = curPts.slice(0, 2);
+    frameLogic(now, curPts.length ? curPts : null);
+  }
+  if (mode === "harp") drawHarpFrame(now / 1000);
+  if (mode === "xylo") drawBars(now / 1000);
+  if (mode === "drums") drawDrums(now / 1000);
+  drawStrings(now / 1000);
+  drawParticles(dt);
+  if (curPts.length) drawHands(curPts);
+  requestAnimationFrame(loop);
+}
+
+/* ---------- Teclado ---------- */
+function audition(s) {
+  const mid = { x: (s.p1.x + s.p2.x) / 2, y: (s.p1.y + s.p2.y) / 2 };
+  pluck(s, mid, 0.03 * W * 0.8, mid.x);
+}
+addEventListener("keydown", e => {
+  if (e.key === "f") {
+    if (document.fullscreenElement) document.exitFullscreen();
+    else document.documentElement.requestFullscreen?.();
+  } else if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+    if (!selected) return;
+    e.preventDefault();
+    selected.freq = clamp(selected.freq * Math.pow(2, (e.key === "ArrowUp" ? 1 : -1) / 12), 55, 1500);
+    audition(selected);
+  } else if (e.key === "Backspace" || e.key === "Delete") {
+    const s = userStrings.pop();
+    if (s && selected === s) selected = userStrings[userStrings.length - 1] || null;
+  } else if (e.key === "c" || e.key === "C") {
+    userStrings.length = 0; selected = null;
+  } else if (e.key === "h" || e.key === "H") {
+    mode = mode === "harp" ? "free" : "harp";
+  } else if (e.key === "x" || e.key === "X") {
+    mode = mode === "xylo" ? "free" : "xylo";
+  } else if (e.key === "d" || e.key === "D") {
+    mode = mode === "drums" ? "free" : "drums";
+  } else if (e.key === "a" || e.key === "A") {
+    autoOn = !autoOn;
+  }
+});
+
+/* ---------- Arranque ---------- */
+async function makeLandmarker() {
+  const fs = await FilesetResolver.forVisionTasks(WASM_URL);
+  const opts = { runningMode: "VIDEO", numHands: 2,
+                 minHandDetectionConfidence: 0.5, minHandPresenceConfidence: 0.5, minTrackingConfidence: 0.5 };
+  try {
+    return await HandLandmarker.createFromOptions(fs, { ...opts, baseOptions: { modelAssetPath: MODEL_URL, delegate: "GPU" } });
+  } catch {
+    return await HandLandmarker.createFromOptions(fs, { ...opts, baseOptions: { modelAssetPath: MODEL_URL, delegate: "CPU" } });
+  }
+}
+
+async function start(m, b) {
+  mode = m;
+  menu.querySelectorAll("button").forEach(x => { x.disabled = true; });
+  b.textContent = "…";
+  try {
+    buildAudio();                       // dentro del clic: el audio necesita gesto del usuario
+    await actx.resume();
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+    video.srcObject = stream;
+    await video.play();
+    landmarker = await makeLandmarker();
+    menu.remove();
+    document.body.classList.add("running");
+    last = performance.now();
+    requestAnimationFrame(loop);
+  } catch (e) {
+    console.error(e);
+    menu.querySelectorAll("button").forEach(x => { x.disabled = false; });
+    b.textContent = b.dataset.mode === "harp" ? "Arpa llanera" : "Cuerdas libres";
+    if (e.name === "NotAllowedError") alert("Permite la cámara para este sitio y vuelve a intentarlo.");
+  }
+}
+
+menu.querySelectorAll("button").forEach(b => b.addEventListener("click", () => start(b.dataset.mode, b)));
+// Liberar la cámara al salir de la página
+addEventListener("pagehide", () => {
+  video.srcObject?.getTracks().forEach(t => t.stop());
+});
+// Depuración solo con ?debug (no se expone en la versión normal)
+if (params.has("debug")) window.__arpa = { user: userStrings, auto: strings, log: dbg, get harp() { return harp; }, get xylo() { return xylo; }, get drums() { return drums; }, get mode() { return mode; }, get selected() { return selected; }, get pts() { return curPts; } };
+</script>
+</body>
+</html>
