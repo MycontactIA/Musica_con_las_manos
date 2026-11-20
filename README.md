@@ -7,6 +7,10 @@ Instrumentos virtuales que se tocan en el aire con la cámara web: **arpa llaner
 
 ## Cómo usarla
 
+**En línea (HTTPS, sin servidor local):** https://mycontactia.github.io/Musica_con_las_manos/
+
+**En local:**
+
 1. Descarga `index.html` y ábrelo con un servidor local (la cámara necesita `localhost` o HTTPS):
    ```
    python3 -m http.server 8000 --bind 127.0.0.1
